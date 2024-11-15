@@ -1,6 +1,5 @@
 #include <Windows.h>
 #include <TlHelp32.h>
-#pragma comment(lib, "User32.lib")
 
 // RtlUserThreadStart hook
 #ifdef _WIN64
@@ -46,10 +45,106 @@ void hkLoadLibraryW(wchar_t* pDll);
 void hkLoadLibraryA(char* pDll);
 void CheckAllocatedMemory(bool bDump = true, bool bJustStrip = false);
 void RemoveFreedBlocks();
+void VerifyHooks(bool bSetup = false);
+bool MatchesPattern(void* pMem, BYTE* pPattern, char* pMask);
+void AttemptPERecovery(BYTE* pPE);
+LONG ExceptionHandler(EXCEPTION_POINTERS* pException);
 
+int main(int argc, char** argv) {
+	// Vars
+	HMODULE hMod = NULL;
+	DWORD dwOldProtect = 0;
+
+	// Console setup
+	SetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+	hStdout = GetStdHandle(STD_OUTPUT_HANDLE);
+
+	// Config
+	char OutPath[MAX_PATH] = { 0 };
+	GetPrivateProfileString("Dumper", "sOutPath", ".", OutPath, MAX_PATH, ".\\InjectDumper.ini");
+	iThreadBytes = GetPrivateProfileInt("Dumper", "iThreadBytes", -1, ".\\InjectDumper.ini");
+	if (iThreadBytes < 0) {
+		HANDLE hConfig = CreateFile("InjectDumper.ini", GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+		if (hConfig && hConfig != INVALID_HANDLE_VALUE) {
+			WriteFile(hConfig, "[Dumper]\niThreadBytes=2048\nsOutPath=.\n", lstrlen("[Dumper]\niThreadBytes=2048\nsOutPath=.\n"), NULL, NULL);
+			CloseHandle(hConfig);
+		}
+		iThreadBytes = 2048;
+	}
+	if (!lstrlen(OutPath)) {
+		OutPath[0] = '.';
+		OutPath[1] = '\\';
+		OutPath[2] = 0;
+	}
+	else {
+		int l = lstrlen(OutPath);
+		if (OutPath[l - 1] != '\\' && OutPath[l - 1] != '/') {
+			OutPath[l] = '\\';
+			OutPath[l + 1] = 0;
+		}
+		for (int i = 0; i < l; i++) {
+			if (OutPath[i] == '/') OutPath[i] = '\\';
+		}
+	}
+	if (!CreateDirectory(OutPath, NULL) && GetLastError() == ERROR_PATH_NOT_FOUND) {
+		WriteConsole(hStdout, BAD "Failed to set directory, using local directory instead\n", lstrlen(BAD "Failed to set directory, using local directory instead\n"), NULL, NULL);
+	}
+	else {
+		SetCurrentDirectory(OutPath);
+	}
+
+	// Setup mutex
+	srand(GetTickCount64());
+	for (int i = 0; i < MAX_PATH - 1; i++) {
+		MutexName[i] = rand() % 256;
+	}
+
+	// Get RtlUserThreadStart
+	hMod = GetModuleHandle("ntdll");
+	if (!hMod) {
+		WriteConsole(hStdout, BAD "Failed to locate ntdll\n", lstrlen(BAD "Failed to locate ntdll\n"), NULL, NULL);
+		goto exit;
+	}
+	Funcs::pRtlUserThreadStart = GetProcAddress(hMod, "RtlUserThreadStart");
+	if (!Funcs::pRtlUserThreadStart) {
+		WriteConsole(hStdout, BAD "Failed to locate RtlUserThreadStart\n", lstrlen(BAD "Failed to locate RtlUserThreadStart\n"), NULL, NULL);
+		goto exit;
+	}
+
+	// Get function addresses
+	Funcs::pLdrLoadDll = GetProcAddress(hMod, "LdrLoadDll");
+	Funcs::pLoadLibraryA = LoadLibraryA;
+	Funcs::pLoadLibraryExA = LoadLibraryExA;
+	Funcs::pLoadLibraryW = LoadLibraryW;
+	Funcs::pLoadLibraryExW = LoadLibraryExW;
+
+	// Hook RtlUserThreadStart
+	VerifyHooks(true);
+
+	// Extra setup stuff
+	dwMainThreadId = GetCurrentThreadId();
+	CheckAllocatedMemory(false);
+	SetProcessDEPPolicy(PROCESS_DEP_ENABLE);
+	if (!AddVectoredExceptionHandler(1, (PVECTORED_EXCEPTION_HANDLER)ExceptionHandler)) {
+		WriteConsoleA(hStdout, BAD "Failed to create exception handler\n", lstrlen(BAD "Failed to create exception handler\n"), NULL, NULL);
+		goto exit;
+	}
+
+	// Loop
+	WriteConsole(hStdout, GOOD "Watching for injections\n", lstrlen(GOOD "Watching for injections\n"), NULL, NULL);
+	while (1) {
+		RemoveFreedBlocks();
+		CheckAllocatedMemory(false, true);
+		Sleep(1);
+	}
+
+exit:
+	Sleep(INFINITE);
+	return 0;
+}
 
 /*** Utility functions ***/
-void VerifyHooks(bool bSetup = false) {
+void VerifyHooks(bool bSetup) {
 	DWORD dwOldProtect = 0;
 
 	// RtlUserThreadStart
@@ -384,97 +479,4 @@ void hkLoadLibraryA(char* pDll) {
 
 	CopyFile(pDll, pDll + i, FALSE);
 	_exit(1); // exit for safety
-}
-
-
-/*** Entry ***/
-int main(int argc, char** argv) {
-	// Vars
-	HMODULE hMod = NULL;
-	DWORD dwOldProtect = 0;
-
-	// Console setup
-	SetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
-	hStdout = GetStdHandle(STD_OUTPUT_HANDLE);
-
-	// Config
-	char OutPath[MAX_PATH] = { 0 };
-	GetPrivateProfileString("Dumper", "sOutPath", ".", OutPath, MAX_PATH, ".\\InjectDumper.ini");
-	iThreadBytes = GetPrivateProfileInt("Dumper", "iThreadBytes", -1, ".\\InjectDumper.ini");
-	if (iThreadBytes < 0) {
-		HANDLE hConfig = CreateFile("InjectDumper.ini", GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-		if (hConfig && hConfig != INVALID_HANDLE_VALUE) {
-			WriteFile(hConfig, "[Dumper]\niThreadBytes=2048\nsOutPath=.\n", lstrlen("[Dumper]\niThreadBytes=2048\nsOutPath=.\n"), NULL, NULL);
-			CloseHandle(hConfig);
-		}
-		iThreadBytes = 2048;
-	}
-	if (!lstrlen(OutPath)) {
-		OutPath[0] = '.';
-		OutPath[1] = '\\';
-		OutPath[2] = 0;
-	} else {
-		int l = lstrlen(OutPath);
-		if (OutPath[l -1] != '\\' && OutPath[l - 1] != '/') {
-			OutPath[l] = '\\';
-			OutPath[l + 1] = 0;
-		}
-		for (int i = 0; i < l; i++) {
-			if (OutPath[i] == '/') OutPath[i] = '\\';
-		}
-	}
-	if (!CreateDirectory(OutPath, NULL) && GetLastError() == ERROR_PATH_NOT_FOUND) {
-		WriteConsole(hStdout, BAD "Failed to set directory, using local directory instead\n", lstrlen(BAD "Failed to set directory, using local directory instead\n"), NULL, NULL);
-	} else {
-		SetCurrentDirectory(OutPath);
-	}
-
-	// Setup mutex
-	srand(GetTickCount64());
-	for (int i = 0; i < MAX_PATH - 1; i++) {
-		MutexName[i] = rand() % 256;
-	}
-
-	// Get RtlUserThreadStart
-	hMod = GetModuleHandle("ntdll");
-	if (!hMod) {
-		WriteConsole(hStdout, BAD "Failed to locate ntdll\n", lstrlen(BAD "Failed to locate ntdll\n"), NULL, NULL);
-		goto exit;
-	}
-	Funcs::pRtlUserThreadStart = GetProcAddress(hMod, "RtlUserThreadStart");
-	if (!Funcs::pRtlUserThreadStart) {
-		WriteConsole(hStdout, BAD "Failed to locate RtlUserThreadStart\n", lstrlen(BAD "Failed to locate RtlUserThreadStart\n"), NULL, NULL);
-		goto exit;
-	}
-
-	// Get function addresses
-	Funcs::pLdrLoadDll = GetProcAddress(hMod, "LdrLoadDll");
-	Funcs::pLoadLibraryA = LoadLibraryA;
-	Funcs::pLoadLibraryExA = LoadLibraryExA;
-	Funcs::pLoadLibraryW = LoadLibraryW;
-	Funcs::pLoadLibraryExW = LoadLibraryExW;
-
-	// Hook RtlUserThreadStart
-	VerifyHooks(true);
-	
-	// Extra setup stuff
-	dwMainThreadId = GetCurrentThreadId();
-	CheckAllocatedMemory(false);
-	SetProcessDEPPolicy(PROCESS_DEP_ENABLE);
-	if (!AddVectoredExceptionHandler(1, (PVECTORED_EXCEPTION_HANDLER)ExceptionHandler)) {
-		WriteConsoleA(hStdout, BAD "Failed to create exception handler\n", lstrlen(BAD "Failed to create exception handler\n"), NULL, NULL);
-		goto exit;
-	}
-	
-	// Loop
-	WriteConsole(hStdout, GOOD "Watching for injections\n", lstrlen(GOOD "Watching for injections\n"), NULL, NULL);
-	while (1) {
-		RemoveFreedBlocks();
-		CheckAllocatedMemory(false, true);
-		Sleep(1);
-	}
-
-exit:
-	Sleep(INFINITE);
-	return 0;
 }
